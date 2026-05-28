@@ -1,0 +1,274 @@
+// Smart Home — Prisma schema
+// 9 tables: users, rooms, devices, telemetry, telemetry_aggregated,
+// device_logs, scenarios, alerts, notifications.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// -----------------------------------------------------------------------------
+// Enums
+// -----------------------------------------------------------------------------
+
+enum UserRole {
+  admin
+  user
+}
+
+enum DeviceType {
+  thermostat
+  lamp
+  motion_sensor
+  power_meter
+  air_quality
+  water_leak
+  smart_lock
+}
+
+enum DeviceStatus {
+  on
+  off
+}
+
+enum MetricType {
+  temperature
+  humidity
+  power
+  motion
+  co2
+  light_level
+  water_leak
+}
+
+enum AggregationPeriod {
+  hour
+  day
+}
+
+enum ScenarioTriggerType {
+  time
+  sensor
+  manual
+}
+
+enum AlertCondition {
+  gt    // >
+  lt    // <
+  eq    // ==
+  gte   // >=
+  lte   // <=
+}
+
+enum NotificationType {
+  warning
+  info
+  alert
+}
+
+// -----------------------------------------------------------------------------
+// Tables
+// -----------------------------------------------------------------------------
+
+model User {
+  id            String   @id @default(uuid()) @db.Uuid
+  email         String   @unique
+  passwordHash  String   @map("password_hash")
+  fullName      String   @map("full_name")
+  role          UserRole @default(user)
+  /// Public URL of the user's profile picture (e.g. `/uploads/avatars/<file>`).
+  avatarUrl     String?  @map("avatar_url")
+  /// Brand (accent) palette key, e.g. "blue". Null = use client default.
+  themeBrand    String?  @map("theme_brand")
+  /// Primary (sidebar/topbar) palette key, e.g. "slate" or "snow".
+  themePrimary  String?  @map("theme_primary")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  houses        House[]
+  scenarios     Scenario[]
+  notifications Notification[]
+  deviceLogs    DeviceLog[]
+
+  @@map("users")
+}
+
+model House {
+  id        Int      @id @default(autoincrement())
+  userId    String   @map("user_id") @db.Uuid
+  name      String
+  address   String?
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  rooms  Room[]
+  alerts Alert[]
+
+  @@index([userId])
+  @@map("houses")
+}
+
+model Room {
+  id           Int      @id @default(autoincrement())
+  houseId      Int      @map("house_id")
+  name         String
+  description  String?
+  floorplanUrl String?  @map("floorplan_url")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  house   House    @relation(fields: [houseId], references: [id], onDelete: Cascade)
+  devices Device[]
+
+  @@index([houseId])
+  @@map("rooms")
+}
+
+model Device {
+  id         String       @id @default(uuid()) @db.Uuid
+  roomId     Int          @map("room_id")
+  name       String
+  type       DeviceType
+  status     DeviceStatus @default(off)
+  isOnline   Boolean      @default(true) @map("is_online")
+  /// Normalized coordinates [0..1] inside Room.floorplanUrl. Null = not placed on the plan.
+  floorplanX Float?       @map("floorplan_x")
+  floorplanY Float?       @map("floorplan_y")
+  createdAt  DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  room                Room                  @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  telemetry           Telemetry[]
+  telemetryAggregated TelemetryAggregated[]
+  logs                DeviceLog[]
+  notifications       Notification[]
+  alertEvents         AlertEvent[]
+
+  @@index([roomId])
+  @@map("devices")
+}
+
+model Telemetry {
+  id         BigInt     @id @default(autoincrement())
+  deviceId   String     @map("device_id") @db.Uuid
+  metricType MetricType @map("metric_type")
+  value      Decimal    @db.Decimal(14, 4)
+  unit       String
+  timestamp  DateTime   @default(now()) @db.Timestamptz(6)
+
+  device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  // Hot path: latest values + range queries per device
+  @@index([deviceId, timestamp(sort: Desc)])
+  @@index([metricType, timestamp(sort: Desc)])
+  @@map("telemetry")
+}
+
+model TelemetryAggregated {
+  id          BigInt            @id @default(autoincrement())
+  deviceId    String            @map("device_id") @db.Uuid
+  metricType  MetricType        @map("metric_type")
+  period      AggregationPeriod
+  avgValue    Decimal           @map("avg_value") @db.Decimal(14, 4)
+  minValue    Decimal           @map("min_value") @db.Decimal(14, 4)
+  maxValue    Decimal           @map("max_value") @db.Decimal(14, 4)
+  periodStart DateTime          @map("period_start") @db.Timestamptz(6)
+
+  device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@unique([deviceId, metricType, period, periodStart], name: "uniq_aggregation_bucket")
+  @@index([deviceId, metricType, period, periodStart(sort: Desc)])
+  @@map("telemetry_aggregated")
+}
+
+model DeviceLog {
+  id        BigInt   @id @default(autoincrement())
+  deviceId  String   @map("device_id") @db.Uuid
+  userId    String?  @map("user_id") @db.Uuid
+  action    String
+  oldValue  String?  @map("old_value")
+  newValue  String?  @map("new_value")
+  timestamp DateTime @default(now()) @db.Timestamptz(6)
+
+  device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  user   User?  @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([deviceId, timestamp(sort: Desc)])
+  @@map("device_logs")
+}
+
+model Scenario {
+  id           Int                 @id @default(autoincrement())
+  userId       String              @map("user_id") @db.Uuid
+  name         String
+  triggerType  ScenarioTriggerType @map("trigger_type")
+  triggerValue Json                @map("trigger_value")
+  actions      Json
+  isActive     Boolean             @default(true) @map("is_active")
+  createdAt    DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("scenarios")
+}
+
+model Alert {
+  id             Int            @id @default(autoincrement())
+  houseId        Int            @map("house_id")
+  name           String?
+  metricType     MetricType     @map("metric_type")
+  condition      AlertCondition
+  thresholdValue Decimal        @map("threshold_value") @db.Decimal(14, 4)
+  isActive       Boolean        @default(true) @map("is_active")
+  createdAt      DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  house  House        @relation(fields: [houseId], references: [id], onDelete: Cascade)
+  events AlertEvent[]
+
+  @@index([houseId, metricType])
+  @@map("alerts")
+}
+
+model AlertEvent {
+  id             Int            @id @default(autoincrement())
+  alertId        Int            @map("alert_id")
+  deviceId       String         @map("device_id") @db.Uuid
+  metricType     MetricType     @map("metric_type")
+  /// Value that first crossed the threshold; preserved for the audit trail.
+  triggerValue   Decimal        @map("trigger_value") @db.Decimal(14, 4)
+  /// Latest value while the breach is still active — updated on every evaluation.
+  latestValue    Decimal        @map("latest_value") @db.Decimal(14, 4)
+  unit           String
+  thresholdValue Decimal        @map("threshold_value") @db.Decimal(14, 4)
+  condition      AlertCondition
+  triggeredAt    DateTime       @default(now()) @map("triggered_at") @db.Timestamptz(6)
+  lastSeenAt     DateTime       @default(now()) @map("last_seen_at") @db.Timestamptz(6)
+  clearedAt      DateTime?      @map("cleared_at") @db.Timestamptz(6)
+  /// `auto` — condition no longer holds; `manual` — user clicked clear.
+  clearReason    String?        @map("clear_reason")
+
+  alert  Alert  @relation(fields: [alertId], references: [id], onDelete: Cascade)
+  device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([alertId, clearedAt, triggeredAt(sort: Desc)])
+  @@index([deviceId, clearedAt])
+  @@map("alert_events")
+}
+
+model Notification {
+  id        Int              @id @default(autoincrement())
+  userId    String           @map("user_id") @db.Uuid
+  deviceId  String?          @map("device_id") @db.Uuid
+  message   String
+  type      NotificationType @default(info)
+  isRead    Boolean          @default(false) @map("is_read")
+  createdAt DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  device Device? @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("notifications")
+}
